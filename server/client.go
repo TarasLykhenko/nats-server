@@ -972,6 +972,13 @@ func (c *client) applyAccountLimits() {
 				}
 			}
 		}
+	} else if c.user != nil { // user jwt not kept, e.g. auth callout
+		if c.user.mpay > 0 {
+			atomic.StoreInt32(&c.mpay, c.user.mpay)
+		}
+		if c.user.msubs > 0 {
+			c.msubs = c.user.msubs
+		}
 	}
 
 	c.acc.mu.RLock()
@@ -1064,6 +1071,10 @@ func (c *client) RegisterNkeyUser(user *NkeyUser) error {
 
 	c.mu.Lock()
 	c.user = user
+	// Account limits were applied on register, before the user was set.
+	if user.mpay > 0 || user.msubs > 0 {
+		c.applyAccountLimits()
+	}
 	// Assign permissions.
 	if user.Permissions == nil {
 		// Reset perms to nil in case client previously had them.

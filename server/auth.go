@@ -70,6 +70,10 @@ type NkeyUser struct {
 	AllowedConnectionTypes map[string]struct{} `json:"connection_types,omitempty"`
 	ProxyRequired          bool                `json:"proxy_required,omitempty"`
 	defaultPerms           bool
+	// Max payload and subscriptions from the user JWT, used when the client does
+	// not keep the JWT, e.g. after an auth callout. Zero means no limit.
+	mpay  int32
+	msubs int32
 }
 
 // User is for multiple accounts/users.

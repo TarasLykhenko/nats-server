@@ -3705,6 +3705,178 @@ func TestAuthCalloutLeafNodeAndConfigMode(t *testing.T) {
 
 }
 
+func TestAuthCalloutUserLimits(t *testing.T) {
+	conf := `
+		listen: "127.0.0.1:-1"
+		accounts {
+			AUTH { users [ {user: "auth", password: "pwd"} ] }
+			A {}
+			B { limits { max_subscriptions: 1 } }
+		}
+		authorization {
+			timeout: 1s
+			auth_callout {
+				issuer: "ABJHLOVMPA4CI6R5KLNGOB4GSLNIY7IOUPAJC4YFNDLQVIOBYQGUWVLA"
+				account: AUTH
+				auth_users: [ auth ]
+			}
+		}
+	`
+	handler := func(m *nats.Msg) {
+		user, si, _, opts, _ := decodeAuthRequest(t, m.Data)
+		var ujwt string
+		switch opts.Username {
+		case "limited":
+			j := jwt.UserPermissionLimits{}
+			j.Subs, j.Payload = 2, 100
+			ujwt = createAuthUser(t, user, _EMPTY_, "A", "", nil, 0, &j)
+		case "zero":
+			// Limits left at their zero value must not restrict the user.
+			ujwt = createAuthUser(t, user, _EMPTY_, "A", "", nil, 0, &jwt.UserPermissionLimits{})
+		case "account":
+			j := jwt.UserPermissionLimits{}
+			j.Subs, j.Payload = 2, 100
+			ujwt = createAuthUser(t, user, _EMPTY_, "B", "", nil, 0, &j)
+		default:
+			m.Respond(nil)
+			return
+		}
+		m.Respond(serviceResponse(t, user, si.ID, ujwt, "", 0))
+	}
+	at := NewAuthTest(t, conf, handler, nats.UserInfo("auth", "pwd"))
+	defer at.Cleanup()
+
+	limits := func(nc *nats.Conn) (int32, int32) {
+		t.Helper()
+		cid, err := nc.GetClientID()
+		require_NoError(t, err)
+		c := at.srv.getClient(cid)
+		require_NotNil(t, c)
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.msubs, atomic.LoadInt32(&c.mpay)
+	}
+
+	errCh := make(chan error, 10)
+	nc := at.Connect(nats.UserInfo("limited", "pwd"),
+		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) { errCh <- err }))
+	defer nc.Close()
+	msubs, mpay := limits(nc)
+	require_Equal(t, msubs, 2)
+	require_Equal(t, mpay, 100)
+
+	natsSubSync(t, nc, "foo")
+	natsSubSync(t, nc, "bar")
+	natsFlush(t, nc)
+	natsSubSync(t, nc, "baz")
+	select {
+	case err := <-errCh:
+		require_Contains(t, err.Error(), "maximum subscriptions exceeded")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Expected maximum subscriptions exceeded error")
+	}
+
+	// Limits are kept when the account limits are applied again on reload.
+	require_NoError(t, at.srv.Reload())
+	msubs, mpay = limits(nc)
+	require_Equal(t, msubs, 2)
+	require_Equal(t, mpay, 100)
+
+	nc = at.Connect(nats.UserInfo("zero", "pwd"))
+	defer nc.Close()
+	msubs, mpay = limits(nc)
+	require_Equal(t, msubs, jwt.NoLimit)
+	require_Equal(t, mpay, at.srv.getOpts().MaxPayload)
+
+	// A lower account limit wins over the user limit.
+	nc = at.Connect(nats.UserInfo("account", "pwd"))
+	defer nc.Close()
+	msubs, mpay = limits(nc)
+	require_Equal(t, msubs, 1)
+	require_Equal(t, mpay, 100)
+}
+
+func TestAuthCalloutUserLimitsLeafNode(t *testing.T) {
+	conf := `
+		listen: "127.0.0.1:-1"
+		accounts {
+			AUTH { users [ {user: "auth", password: "pwd"} ] }
+			A {}
+		}
+		authorization {
+			timeout: 1s
+			auth_callout {
+				issuer: "ABJHLOVMPA4CI6R5KLNGOB4GSLNIY7IOUPAJC4YFNDLQVIOBYQGUWVLA"
+				account: AUTH
+				auth_users: [ auth ]
+			}
+		}
+		leafnodes {
+			listen: "127.0.0.1:-1"
+		}
+	`
+	handler := func(m *nats.Msg) {
+		user, si, _, opts, _ := decodeAuthRequest(t, m.Data)
+		var j *jwt.UserPermissionLimits
+		switch opts.Username {
+		case "client":
+			j = &jwt.UserPermissionLimits{}
+			j.Subs = 1
+			j.Payload = jwt.NoLimit
+		case "leaf":
+		default:
+			m.Respond(nil)
+			return
+		}
+		ujwt := createAuthUser(t, user, _EMPTY_, "A", "", nil, 0, j)
+		m.Respond(serviceResponse(t, user, si.ID, ujwt, "", 0))
+	}
+	at := NewAuthTest(t, conf, handler, nats.UserInfo("auth", "pwd"))
+	defer at.Cleanup()
+
+	errCh := make(chan error, 10)
+	nc := at.Connect(nats.UserInfo("client", "pwd"),
+		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) { errCh <- err }))
+	defer nc.Close()
+	natsSubSync(t, nc, "foo")
+	natsFlush(t, nc)
+	natsSubSync(t, nc, "bar")
+	select {
+	case err := <-errCh:
+		require_Contains(t, err.Error(), "maximum subscriptions exceeded")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Expected maximum subscriptions exceeded error")
+	}
+
+	// The leafnode in the same account is not limited by the client's limits.
+	lconf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: "127.0.0.1:-1"
+		server_name: "LEAF"
+		leafnodes {
+			remotes [{url: "nats://leaf:pwd@127.0.0.1:%d"}]
+		}
+	`, at.srv.getOpts().LeafNode.Port)))
+	leaf, _ := RunServerWithConfig(lconf)
+	defer leaf.Shutdown()
+	checkLeafNodeConnected(t, leaf)
+
+	ncl := natsConnect(t, leaf.ClientURL())
+	defer ncl.Close()
+	subjects := []string{"l1", "l2", "l3"}
+	for _, subj := range subjects {
+		natsSubSync(t, ncl, subj)
+	}
+	natsFlush(t, ncl)
+	for _, subj := range subjects {
+		checkSubInterest(t, at.srv, "A", subj, time.Second)
+	}
+	select {
+	case err := <-errCh:
+		t.Fatalf("Unexpected error: %v", err)
+	default:
+	}
+}
+
 func TestAuthCalloutLeafNodeWSClientTLSCerts(t *testing.T) {
 	conf := `
 		server_name: HUB

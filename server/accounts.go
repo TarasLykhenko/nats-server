@@ -4162,6 +4162,14 @@ func buildInternalNkeyUser(uc *jwt.UserClaims, acts map[string]struct{}, acc *Ac
 	if uc.IssuerAccount != _EMPTY_ {
 		nu.SigningKey = uc.Issuer
 	}
+	// Only positive limits are kept. Auth callout responses were not limited
+	// before, and often leave these at their zero value.
+	if uc.Limits.Payload > 0 {
+		nu.mpay = clampInt64ToInt32(uc.Limits.Payload)
+	}
+	if uc.Limits.Subs > 0 {
+		nu.msubs = clampInt64ToInt32(uc.Limits.Subs)
+	}
 
 	// Now check for permissions.
 	p := buildPermissionsFromJwt(&uc.Permissions)
