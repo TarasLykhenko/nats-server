@@ -3877,6 +3877,70 @@ func TestAuthCalloutUserLimitsLeafNode(t *testing.T) {
 	}
 }
 
+func TestAuthCalloutUserSrcAndTimes(t *testing.T) {
+	conf := `
+		listen: "127.0.0.1:-1"
+		accounts {
+			AUTH { users [ {user: "auth", password: "pwd"} ] }
+			A {}
+		}
+		authorization {
+			timeout: 1s
+			auth_callout {
+				issuer: "ABJHLOVMPA4CI6R5KLNGOB4GSLNIY7IOUPAJC4YFNDLQVIOBYQGUWVLA"
+				account: AUTH
+				auth_users: [ auth ]
+			}
+		}
+	`
+	now := time.Now()
+	limits := map[string]func(j *jwt.UserPermissionLimits){
+		"src_allowed": func(j *jwt.UserPermissionLimits) { j.Src.Set("10.0.0.0/8,127.0.0.1/32") },
+		"src_denied":  func(j *jwt.UserPermissionLimits) { j.Src.Set("10.0.0.0/8") },
+		"times_allowed": func(j *jwt.UserPermissionLimits) {
+			j.Times = []jwt.TimeRange{newTimeRange(now.Add(-time.Hour), 2*time.Hour)}
+		},
+		"times_denied": func(j *jwt.UserPermissionLimits) {
+			j.Times = []jwt.TimeRange{newTimeRange(now.Add(time.Hour), time.Hour)}
+		},
+	}
+	handler := func(m *nats.Msg) {
+		user, si, _, opts, _ := decodeAuthRequest(t, m.Data)
+		set, ok := limits[opts.Username]
+		if !ok {
+			m.Respond(nil)
+			return
+		}
+		j := &jwt.UserPermissionLimits{}
+		j.Subs, j.Data, j.Payload = jwt.NoLimit, jwt.NoLimit, jwt.NoLimit
+		set(j)
+		ujwt := createAuthUser(t, user, _EMPTY_, "A", "", nil, 0, j)
+		m.Respond(serviceResponse(t, user, si.ID, ujwt, "", 0))
+	}
+	at := NewAuthTest(t, conf, handler, nats.UserInfo("auth", "pwd"))
+	defer at.Cleanup()
+
+	for _, test := range []struct {
+		user string
+		ok   bool
+	}{
+		{"src_allowed", true},
+		{"src_denied", false},
+		{"times_allowed", true},
+		{"times_denied", false},
+	} {
+		t.Run(test.user, func(t *testing.T) {
+			if !test.ok {
+				at.RequireConnectError(nats.UserInfo(test.user, "pwd"))
+				return
+			}
+			nc := at.Connect(nats.UserInfo(test.user, "pwd"))
+			defer nc.Close()
+			natsFlush(t, nc)
+		})
+	}
+}
+
 func TestAuthCalloutLeafNodeWSClientTLSCerts(t *testing.T) {
 	conf := `
 		server_name: HUB
